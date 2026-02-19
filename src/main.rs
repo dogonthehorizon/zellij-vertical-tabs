@@ -1246,7 +1246,10 @@ impl State {
         let header_content_rows = if self.style.format_header.is_empty() {
             0
         } else {
-            self.style.format_header.lines().count().max(1)
+            expand_newlines(&self.style.format_header)
+                .lines()
+                .count()
+                .max(1)
         };
         let header_border_rows =
             usize::from(!self.style.header_border.is_empty() && header_content_rows > 0);
@@ -1256,7 +1259,7 @@ impl State {
         let footer_content_rows = if footer_format.is_empty() {
             0
         } else {
-            footer_format.lines().count().max(1)
+            expand_newlines(&footer_format).lines().count().max(1)
         };
         let footer_border_rows =
             usize::from(!self.style.footer_border.is_empty() && footer_content_rows > 0);
@@ -1279,7 +1282,7 @@ impl State {
 
         // Header content (each newline-separated line)
         if header_content_rows > 0 {
-            for header_line in self.style.format_header.clone().lines() {
+            for header_line in expand_newlines(&self.style.format_header.clone()).lines() {
                 let styled = self.expand_generic_format(header_line, tier);
                 lines.push(self.build_plain_line(&styled, cols));
             }
@@ -1308,7 +1311,7 @@ impl State {
 
         // Footer content
         if footer_content_rows > 0 {
-            for footer_line in footer_format.lines() {
+            for footer_line in expand_newlines(&footer_format).lines() {
                 let styled = self.expand_generic_format(footer_line, tier);
                 lines.push(self.build_plain_line(&styled, cols));
             }
@@ -1381,7 +1384,10 @@ impl State {
         let header_content_rows = if self.style.format_header.is_empty() {
             0
         } else {
-            self.style.format_header.lines().count().max(1)
+            expand_newlines(&self.style.format_header)
+                .lines()
+                .count()
+                .max(1)
         };
         let header_border_rows =
             usize::from(!self.style.header_border.is_empty() && header_content_rows > 0);
@@ -1400,7 +1406,7 @@ impl State {
         let footer_rows = if self.style.format_footer.is_empty() {
             0
         } else {
-            self.style.format_footer.lines().count()
+            expand_newlines(&self.style.format_footer).lines().count()
                 + usize::from(!self.style.footer_border.is_empty())
         };
         let available_rows = self
@@ -1483,6 +1489,14 @@ fn calculate_visible_range(
         start_index,
         tab_count.saturating_sub(end_index),
     )
+}
+
+/// Convert literal `\\n` sequences (as received from KDL config) into real newlines.
+/// KDL does not interpret escape sequences inside plain string values, so the plugin
+/// receives the two-character sequence backslash-n.  Callers that need to split on
+/// newlines must run their string through this helper first.
+fn expand_newlines(s: &str) -> String {
+    s.replace("\\n", "\n")
 }
 
 fn truncate_string(s: &str, max_width: usize) -> String {
