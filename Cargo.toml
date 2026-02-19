@@ -9,5 +9,5 @@ license = "MIT"
 # Using git dependency for zellij-tile to get unbold_all() method
 # which is only available in main branch (not yet released to crates.io)
 # This allows us to render non-bold text for a cleaner tmux-like appearance
-zellij-tile = { git = "https://github.com/zellij-org/zellij", branch = "main" }
+zellij-tile = "0.43.1"
 unicode-width = "0.2"
