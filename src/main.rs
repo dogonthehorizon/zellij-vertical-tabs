@@ -291,7 +291,7 @@ fn parse_tmux_format(format: &str) -> Vec<FormatToken> {
                         tokens.push(FormatToken::Literal(std::mem::take(&mut literal)));
                     }
                     chars.next(); // consume '['
-                    // Parse style directive until ']'
+                                  // Parse style directive until ']'
                     let mut style_str = String::new();
                     while let Some(&c) = chars.peek() {
                         if c == ']' {
@@ -417,11 +417,33 @@ fn parse_styled_string(s: &str) -> StyledText {
     result
 }
 
+// ========== COMMAND SYSTEM ==========
+
+/// A single shell command with its polling interval
+#[derive(Debug, Clone)]
+struct CommandDef {
+    /// Full shell command string (run via bash -c)
+    command: String,
+    /// Seconds between executions
+    interval: f64,
+    /// Seconds elapsed since last execution (pre-filled to interval to fire immediately)
+    elapsed: f64,
+}
+
 // ========== CONFIGURATION ==========
 
-/// Styling configuration for tab labels
+/// Rendering tier based on available column width
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum RenderTier {
+    Full,
+    Compact,
+    Minimal,
+}
+
+/// Full styling configuration for the sidebar
 #[derive(Clone)]
 struct StyleConfig {
+    // ---- Tab formatting ----
     format: String,
     format_active: String,
     overflow_above: String,
@@ -433,10 +455,55 @@ struct StyleConfig {
     border: String,
     max_name_length: usize,
     start_index: usize,
+
+    // ---- Header ----
+    /// Newline-separated format string for header area. Supports {session}, {mode}.
+    format_header: String,
+    /// Styled separator rendered below the header (e.g. "#[fg=#494d64]─"). Empty = none.
+    header_border: String,
+    /// Per-mode display strings: mode_key -> (full, compact, minimal)
+    mode_labels: BTreeMap<String, (String, String, String)>,
+    /// Per-mode foreground color string (hex/256): mode_key -> color
+    mode_colors: BTreeMap<String, String>,
+
+    // ---- Footer ----
+    /// Newline-separated format string for footer area. Supports {command_NAME}.
+    format_footer: String,
+    format_footer_compact: String,
+    format_footer_minimal: String,
+    /// Styled separator rendered above the footer. Empty = none.
+    footer_border: String,
+
+    // ---- Adaptive thresholds ----
+    compact_threshold: usize,
+    minimal_threshold: usize,
 }
 
 impl Default for StyleConfig {
     fn default() -> Self {
+        let mut mode_labels: BTreeMap<String, (String, String, String)> = BTreeMap::new();
+        for (key, full, short, icon) in &[
+            ("normal", "NORMAL", "NRM", "N"),
+            ("locked", "LOCKED", "LCK", "L"),
+            ("resize", "RESIZE", "RSZ", "R"),
+            ("pane", "PANE", "PNE", "P"),
+            ("tab", "TAB", "TAB", "T"),
+            ("scroll", "SCROLL", "SCR", "S"),
+            ("entersearch", "SEARCH", "SRC", "?"),
+            ("search", "SEARCH", "SRC", "?"),
+            ("renametab", "RENAME", "RNM", "R"),
+            ("renamepane", "RENAME", "RNM", "R"),
+            ("session", "SESSION", "SES", "S"),
+            ("move", "MOVE", "MOV", "M"),
+            ("prompt", "PROMPT", "PRM", "P"),
+            ("tmux", "TMUX", "TMX", "T"),
+        ] {
+            mode_labels.insert(
+                key.to_string(),
+                (full.to_string(), short.to_string(), icon.to_string()),
+            );
+        }
+
         Self {
             format: "{index}:{name}".to_string(),
             format_active: "{index}:{name} {indicators}".to_string(),
@@ -449,7 +516,76 @@ impl Default for StyleConfig {
             padding_top: 0,
             border: String::new(),
             start_index: 1,
+            format_header: "{session}  {mode}".to_string(),
+            header_border: String::new(),
+            mode_labels,
+            mode_colors: BTreeMap::new(),
+            format_footer: String::new(),
+            format_footer_compact: String::new(),
+            format_footer_minimal: String::new(),
+            footer_border: String::new(),
+            compact_threshold: 18,
+            minimal_threshold: 12,
         }
+    }
+}
+
+impl StyleConfig {
+    fn render_tier(&self, cols: usize) -> RenderTier {
+        if cols < self.minimal_threshold {
+            RenderTier::Minimal
+        } else if cols < self.compact_threshold {
+            RenderTier::Compact
+        } else {
+            RenderTier::Full
+        }
+    }
+
+    fn active_footer_format(&self, tier: RenderTier) -> &str {
+        match tier {
+            RenderTier::Minimal if !self.format_footer_minimal.is_empty() => {
+                &self.format_footer_minimal
+            }
+            RenderTier::Compact if !self.format_footer_compact.is_empty() => {
+                &self.format_footer_compact
+            }
+            _ => &self.format_footer,
+        }
+    }
+
+    /// Returns (label_string, optional_color_string) for the current mode at the given tier.
+    fn mode_display(&self, mode: &InputMode, tier: RenderTier) -> (String, Option<String>) {
+        let key = input_mode_key(mode);
+        let label = self
+            .mode_labels
+            .get(key)
+            .map(|(full, compact, minimal)| match tier {
+                RenderTier::Full => full.clone(),
+                RenderTier::Compact => compact.clone(),
+                RenderTier::Minimal => minimal.clone(),
+            })
+            .unwrap_or_else(|| format!("{:?}", mode).to_uppercase());
+        let color = self.mode_colors.get(key).cloned();
+        (label, color)
+    }
+}
+
+fn input_mode_key(mode: &InputMode) -> &'static str {
+    match mode {
+        InputMode::Normal => "normal",
+        InputMode::Locked => "locked",
+        InputMode::Resize => "resize",
+        InputMode::Pane => "pane",
+        InputMode::Tab => "tab",
+        InputMode::Scroll => "scroll",
+        InputMode::EnterSearch => "entersearch",
+        InputMode::Search => "search",
+        InputMode::RenameTab => "renametab",
+        InputMode::RenamePane => "renamepane",
+        InputMode::Session => "session",
+        InputMode::Move => "move",
+        InputMode::Prompt => "prompt",
+        InputMode::Tmux => "tmux",
     }
 }
 
@@ -466,13 +602,18 @@ struct State {
     permissions_granted: bool,
     is_selectable: bool,
     pending_events: Vec<Event>,
+
+    // Command execution system
+    commands: BTreeMap<String, CommandDef>,
+    command_outputs: BTreeMap<String, String>,
+    timer_ticking: bool,
 }
 
 register_plugin!(State);
 
 impl ZellijPlugin for State {
     fn load(&mut self, configuration: BTreeMap<String, String>) {
-        // Parse style configuration
+        // ---- Tab formatting ----
         if let Some(v) = configuration.get("format") {
             self.style.format = v.clone();
         }
@@ -515,9 +656,133 @@ impl ZellijPlugin for State {
             self.style.start_index = n;
         }
 
+        // ---- Header ----
+        if let Some(v) = configuration.get("format_header") {
+            self.style.format_header = v.clone();
+        }
+        if let Some(v) = configuration.get("header_border") {
+            self.style.header_border = v.clone();
+        }
+
+        // Mode labels: mode_NAME / mode_NAME_compact / mode_NAME_minimal
+        // Mode colors: mode_color_NAME
+        for mode_key in &[
+            "normal",
+            "locked",
+            "resize",
+            "pane",
+            "tab",
+            "scroll",
+            "entersearch",
+            "search",
+            "renametab",
+            "renamepane",
+            "session",
+            "move",
+            "prompt",
+            "tmux",
+        ] {
+            let defaults = self
+                .style
+                .mode_labels
+                .get(*mode_key)
+                .cloned()
+                .unwrap_or_else(|| {
+                    (
+                        mode_key.to_uppercase(),
+                        mode_key.to_uppercase(),
+                        mode_key[..1].to_uppercase(),
+                    )
+                });
+
+            let full = configuration
+                .get(&format!("mode_{}", mode_key))
+                .cloned()
+                .unwrap_or(defaults.0);
+            let compact = configuration
+                .get(&format!("mode_{}_compact", mode_key))
+                .cloned()
+                .unwrap_or(defaults.1);
+            let minimal = configuration
+                .get(&format!("mode_{}_minimal", mode_key))
+                .cloned()
+                .unwrap_or(defaults.2);
+
+            self.style
+                .mode_labels
+                .insert(mode_key.to_string(), (full, compact, minimal));
+
+            if let Some(color) = configuration.get(&format!("mode_color_{}", mode_key)) {
+                self.style
+                    .mode_colors
+                    .insert(mode_key.to_string(), color.clone());
+            }
+        }
+
+        // ---- Footer ----
+        if let Some(v) = configuration.get("format_footer") {
+            self.style.format_footer = v.clone();
+        }
+        if let Some(v) = configuration.get("format_footer_compact") {
+            self.style.format_footer_compact = v.clone();
+        }
+        if let Some(v) = configuration.get("format_footer_minimal") {
+            self.style.format_footer_minimal = v.clone();
+        }
+        if let Some(v) = configuration.get("footer_border") {
+            self.style.footer_border = v.clone();
+        }
+
+        // ---- Adaptive thresholds ----
+        if let Some(v) = configuration.get("compact_threshold")
+            && let Ok(n) = v.parse::<usize>()
+        {
+            self.style.compact_threshold = n;
+        }
+        if let Some(v) = configuration.get("minimal_threshold")
+            && let Ok(n) = v.parse::<usize>()
+        {
+            self.style.minimal_threshold = n;
+        }
+
+        // ---- Commands ----
+        // Parse command_NAME_command / command_NAME_interval pairs
+        let mut command_names: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
+        for key in configuration.keys() {
+            if let Some(rest) = key.strip_prefix("command_")
+                && let Some(name) = rest.strip_suffix("_command")
+            {
+                command_names.insert(name.to_string());
+            }
+        }
+
+        for name in command_names {
+            let cmd_key = format!("command_{}_command", name);
+            let interval_key = format!("command_{}_interval", name);
+
+            if let Some(command) = configuration.get(&cmd_key) {
+                let interval = configuration
+                    .get(&interval_key)
+                    .and_then(|v| v.parse::<f64>().ok())
+                    .unwrap_or(30.0);
+
+                self.commands.insert(
+                    name,
+                    CommandDef {
+                        command: command.clone(),
+                        interval,
+                        // Pre-fill elapsed so the first timer tick fires immediately
+                        elapsed: interval,
+                    },
+                );
+            }
+        }
+
         request_permission(&[
             PermissionType::ReadApplicationState,
             PermissionType::ChangeApplicationState,
+            PermissionType::RunCommands,
         ]);
 
         subscribe(&[
@@ -526,6 +791,8 @@ impl ZellijPlugin for State {
             EventType::ModeUpdate,
             EventType::Mouse,
             EventType::PermissionRequestResult,
+            EventType::RunCommandResult,
+            EventType::Timer,
         ]);
     }
 
@@ -537,6 +804,12 @@ impl ZellijPlugin for State {
                 self.permissions_granted = true;
                 self.is_selectable = false;
                 set_selectable(false);
+
+                // Start the timer loop if commands are configured
+                if !self.commands.is_empty() && !self.timer_ticking {
+                    self.timer_ticking = true;
+                    set_timeout(1.0);
+                }
 
                 while !self.pending_events.is_empty() {
                     let cached_event = self.pending_events.remove(0);
@@ -589,6 +862,47 @@ impl ZellijPlugin for State {
                 }
                 _ => {}
             },
+            Event::Timer(_) => {
+                // Tick each command's elapsed counter; fire those that are due
+                let due: Vec<(String, String)> = self
+                    .commands
+                    .iter_mut()
+                    .filter_map(|(name, def)| {
+                        def.elapsed += 1.0;
+                        if def.elapsed >= def.interval {
+                            def.elapsed = 0.0;
+                            Some((name.clone(), def.command.clone()))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+
+                for (name, command) in due {
+                    let mut context = BTreeMap::new();
+                    context.insert("command_name".to_string(), name);
+                    run_command(&["bash", "-c", &command], context);
+                }
+
+                // Re-arm the 1-second tick
+                if self.timer_ticking {
+                    set_timeout(1.0);
+                }
+            }
+            Event::RunCommandResult(exit_code, stdout, _stderr, context) => {
+                if let Some(name) = context.get("command_name") {
+                    if exit_code == Some(0) || exit_code.is_none() {
+                        let output = String::from_utf8_lossy(&stdout).trim().to_string();
+                        self.command_outputs.insert(name.clone(), output);
+                    } else {
+                        // On error, keep prior value or insert "--"
+                        self.command_outputs
+                            .entry(name.clone())
+                            .or_insert_with(|| "--".to_string());
+                    }
+                    should_render = true;
+                }
+            }
             _ => {}
         }
         should_render
@@ -626,7 +940,7 @@ impl ZellijPlugin for State {
             return;
         }
 
-        self.render_vertical(rows, cols);
+        self.render_sidebar(rows, cols);
     }
 }
 
@@ -649,6 +963,76 @@ impl State {
 
     fn expand_overflow_format(&self, format: &str, count: usize) -> String {
         format.replace("{count}", &count.to_string())
+    }
+
+    /// Expand a generic format string (header/footer) with all available variables.
+    fn expand_generic_format(&self, format: &str, tier: RenderTier) -> StyledText {
+        let tokens = parse_tmux_format(format);
+        let mut result = StyledText::new();
+        let mut current_style = InlineStyle::default();
+
+        let session_name = self
+            .mode_info
+            .session_name
+            .clone()
+            .unwrap_or_else(|| "zellij".to_string());
+
+        let (mode_label, mode_color_str) = self.style.mode_display(&self.mode_info.mode, tier);
+
+        for token in tokens {
+            match token {
+                FormatToken::Style(style) => {
+                    current_style = style;
+                }
+                FormatToken::Literal(text) => {
+                    result.push(text, current_style.clone());
+                }
+                FormatToken::Variable { name, width } => {
+                    match name.as_str() {
+                        "session" => {
+                            let text = if let Some(w) = width {
+                                truncate_string(&session_name, w)
+                            } else {
+                                session_name.clone()
+                            };
+                            result.push(text, current_style.clone());
+                        }
+                        "mode" => {
+                            // Apply mode-specific color override if configured
+                            let mut mode_style = current_style.clone();
+                            if let Some(ref color_str) = mode_color_str {
+                                mode_style.fg = parse_color_spec(color_str);
+                            }
+                            let text = if let Some(w) = width {
+                                truncate_string(&mode_label, w)
+                            } else {
+                                mode_label.clone()
+                            };
+                            result.push(text, mode_style);
+                        }
+                        other => {
+                            // command_NAME variables
+                            let raw = if let Some(cmd_name) = other.strip_prefix("command_") {
+                                self.command_outputs
+                                    .get(cmd_name)
+                                    .cloned()
+                                    .unwrap_or_else(|| "--".to_string())
+                            } else {
+                                format!("{{{}}}", other)
+                            };
+                            let text = if let Some(w) = width {
+                                truncate_string(&raw, w)
+                            } else {
+                                raw
+                            };
+                            result.push(text, current_style.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        result
     }
 
     /// Expand a tmux-style format string with tab info, returning styled text
@@ -744,7 +1128,7 @@ impl State {
         result
     }
 
-    /// Build a complete line with content, padding, and border
+    /// Build a complete tab line with content, optional fill, padding, and side border
     fn build_line(&self, content: &StyledText, cols: usize, is_selected: bool) -> String {
         let border = parse_styled_string(&self.style.border);
         let border_width = border.display_width();
@@ -763,17 +1147,15 @@ impl State {
 
         if has_fill {
             // Fill mode: use reverse video with swapped colors so bg fills the row
-            // User writes #[bg=236,fill] -> we swap to fg=236 -> reverse makes displayed bg=236
             line.push_str("\x1b[7m");
 
             for segment in &content.segments {
-                // Swap fg and bg for reverse video
                 let mut swapped_style = segment.style.clone();
                 std::mem::swap(&mut swapped_style.fg, &mut swapped_style.bg);
-                swapped_style.fill = false; // Don't need fill flag in output
+                swapped_style.fill = false;
 
                 if swapped_style.has_any_style() {
-                    line.push_str("\x1b[0m\x1b[7m"); // Reset and re-apply reverse
+                    line.push_str("\x1b[0m\x1b[7m");
                     line.push_str(&swapped_style.to_ansi());
                 }
                 line.push_str(&segment.text);
@@ -785,7 +1167,6 @@ impl State {
 
             line.push_str("\x1b[0m");
         } else {
-            // Normal rendering - bg colors only apply to text, not padding
             line.push_str(&content.to_ansi());
 
             if padding_needed > 0 {
@@ -793,7 +1174,7 @@ impl State {
             }
         }
 
-        // Add border (not affected by selection)
+        // Add right-side border (not affected by selection fill)
         if border_width > 0 {
             line.push_str(&border.to_ansi());
         }
@@ -801,7 +1182,48 @@ impl State {
         line
     }
 
-    /// Build a line with just the border (for empty rows)
+    /// Build a plain line (no tab side-border): truncated content + space padding
+    fn build_plain_line(&self, content: &StyledText, cols: usize) -> String {
+        let content = content.truncate(cols);
+        let content_width = content.display_width();
+        let padding_needed = cols.saturating_sub(content_width);
+        let mut line = content.to_ansi();
+        if padding_needed > 0 {
+            line.push_str(&" ".repeat(padding_needed));
+        }
+        line
+    }
+
+    /// Build a full-width separator line by repeating the first char of the separator format
+    fn build_separator_line(&self, separator_format: &str, cols: usize) -> String {
+        if separator_format.is_empty() || cols == 0 {
+            return " ".repeat(cols);
+        }
+
+        let styled = parse_styled_string(separator_format);
+        if styled.segments.is_empty() {
+            return " ".repeat(cols);
+        }
+
+        let fill_char = styled.segments[0].text.chars().next().unwrap_or('─');
+        let fill_char_width = fill_char.to_string().width().max(1);
+        let repeat_count = cols / fill_char_width;
+        let remainder = cols % fill_char_width;
+
+        let mut filled = StyledText::new();
+        filled.push(
+            fill_char.to_string().repeat(repeat_count),
+            styled.segments[0].style.clone(),
+        );
+
+        let mut line = filled.to_ansi();
+        if remainder > 0 {
+            line.push_str(&" ".repeat(remainder));
+        }
+        line
+    }
+
+    /// Build an empty line (spaces + optional side border)
     fn build_empty_line(&self, cols: usize) -> String {
         let border = parse_styled_string(&self.style.border);
         let border_width = border.display_width();
@@ -816,60 +1238,86 @@ impl State {
         line
     }
 
-    fn render_vertical(&mut self, rows: usize, cols: usize) {
+    /// Main render function: computes row budgets then renders header → tabs → footer.
+    fn render_sidebar(&mut self, rows: usize, cols: usize) {
+        let tier = self.style.render_tier(cols);
+
+        // ---- Compute row budgets ----
+        let header_content_rows = if self.style.format_header.is_empty() {
+            0
+        } else {
+            self.style.format_header.lines().count().max(1)
+        };
+        let header_border_rows =
+            usize::from(!self.style.header_border.is_empty() && header_content_rows > 0);
+        let header_rows = header_content_rows + header_border_rows;
+
+        let footer_format = self.style.active_footer_format(tier).to_string();
+        let footer_content_rows = if footer_format.is_empty() {
+            0
+        } else {
+            footer_format.lines().count().max(1)
+        };
+        let footer_border_rows =
+            usize::from(!self.style.footer_border.is_empty() && footer_content_rows > 0);
+        let footer_rows = footer_content_rows + footer_border_rows;
+
         let top_padding = self.style.padding_top;
-        let available_rows = rows.saturating_sub(top_padding);
 
-        let tab_count = self.tabs.len();
-        let active_index = self.active_tab_idx.saturating_sub(1);
+        let available_for_tabs = rows
+            .saturating_sub(header_rows)
+            .saturating_sub(footer_rows)
+            .saturating_sub(top_padding);
 
-        let (start_index, end_index, tabs_above, tabs_below) =
-            calculate_visible_range(tab_count, available_rows, active_index);
-
+        // ---- Assemble lines ----
         let mut lines: Vec<String> = Vec::with_capacity(rows);
 
-        // Add top padding lines
+        // Top padding
         for _ in 0..top_padding {
             lines.push(self.build_empty_line(cols));
         }
 
-        // Render "above" overflow indicator
-        if tabs_above > 0 {
-            let indicator_text =
-                self.expand_overflow_format(&self.style.overflow_above, tabs_above);
-            let styled = parse_styled_string(&indicator_text);
-            lines.push(self.build_line(&styled, cols, false));
-        }
-
-        // Render visible tabs
-        for i in start_index..end_index {
-            if let Some(tab) = self.tabs.get(i).cloned() {
-                let is_active = tab.active;
-                let format = if is_active {
-                    &self.style.format_active
-                } else {
-                    &self.style.format
-                };
-
-                let styled = self.expand_tmux_format(format, &tab, i + self.style.start_index);
-                lines.push(self.build_line(&styled, cols, is_active));
+        // Header content (each newline-separated line)
+        if header_content_rows > 0 {
+            for header_line in self.style.format_header.clone().lines() {
+                let styled = self.expand_generic_format(header_line, tier);
+                lines.push(self.build_plain_line(&styled, cols));
             }
         }
 
-        // Render "below" overflow indicator
-        if tabs_below > 0 {
-            let indicator_text =
-                self.expand_overflow_format(&self.style.overflow_below, tabs_below);
-            let styled = parse_styled_string(&indicator_text);
-            lines.push(self.build_line(&styled, cols, false));
+        // Header separator
+        if header_border_rows > 0 {
+            let sep = self.style.header_border.clone();
+            lines.push(self.build_separator_line(&sep, cols));
         }
 
-        // Fill remaining rows with empty lines (just border)
-        while lines.len() < rows {
+        // Tabs
+        let tab_lines = self.render_tab_lines(available_for_tabs, cols);
+        lines.extend(tab_lines);
+
+        // Gap fill (pushes footer to the bottom)
+        while lines.len() < rows.saturating_sub(footer_rows) {
             lines.push(self.build_empty_line(cols));
         }
 
-        // Print all lines with ANSI styling
+        // Footer separator
+        if footer_border_rows > 0 {
+            let sep = self.style.footer_border.clone();
+            lines.push(self.build_separator_line(&sep, cols));
+        }
+
+        // Footer content
+        if footer_content_rows > 0 {
+            for footer_line in footer_format.lines() {
+                let styled = self.expand_generic_format(footer_line, tier);
+                lines.push(self.build_plain_line(&styled, cols));
+            }
+        }
+
+        // Safety clamp (should never be needed, but prevents terminal corruption)
+        lines.truncate(rows);
+
+        // Print all lines
         for (i, line) in lines.iter().enumerate() {
             if i < lines.len() - 1 {
                 println!("{}\x1b[m", line);
@@ -879,25 +1327,99 @@ impl State {
         }
     }
 
-    fn get_tab_at_row(&self, row: usize) -> Option<usize> {
-        if self.tabs.is_empty() {
-            return None;
+    /// Render tab entries into the available row budget, returns Vec of ANSI strings.
+    fn render_tab_lines(&self, available_rows: usize, cols: usize) -> Vec<String> {
+        if self.tabs.is_empty() || available_rows == 0 {
+            return vec![];
         }
 
         let tab_count = self.tabs.len();
         let active_index = self.active_tab_idx.saturating_sub(1);
 
+        let (start_index, end_index, tabs_above, tabs_below) =
+            calculate_visible_range(tab_count, available_rows, active_index);
+
+        let mut lines: Vec<String> = Vec::with_capacity(available_rows);
+
+        // "above" overflow indicator
+        if tabs_above > 0 {
+            let text = self.expand_overflow_format(&self.style.overflow_above, tabs_above);
+            let styled = parse_styled_string(&text);
+            lines.push(self.build_line(&styled, cols, false));
+        }
+
+        // Visible tab entries
+        for i in start_index..end_index {
+            if let Some(tab) = self.tabs.get(i).cloned() {
+                let is_active = tab.active;
+                let format = if is_active {
+                    &self.style.format_active.clone()
+                } else {
+                    &self.style.format.clone()
+                };
+                let styled = self.expand_tmux_format(format, &tab, i + self.style.start_index);
+                lines.push(self.build_line(&styled, cols, is_active));
+            }
+        }
+
+        // "below" overflow indicator
+        if tabs_below > 0 {
+            let text = self.expand_overflow_format(&self.style.overflow_below, tabs_below);
+            let styled = parse_styled_string(&text);
+            lines.push(self.build_line(&styled, cols, false));
+        }
+
+        lines
+    }
+
+    fn get_tab_at_row(&self, row: usize) -> Option<usize> {
+        if self.tabs.is_empty() {
+            return None;
+        }
+
+        // Compute how many rows the header occupies so we can offset the click
+        let header_content_rows = if self.style.format_header.is_empty() {
+            0
+        } else {
+            self.style.format_header.lines().count().max(1)
+        };
+        let header_border_rows =
+            usize::from(!self.style.header_border.is_empty() && header_content_rows > 0);
+        let header_rows = header_content_rows + header_border_rows + self.style.padding_top;
+
+        // Clicks in the header area are not tab clicks
+        if row < header_rows {
+            return None;
+        }
+        let row_in_tabs = row - header_rows;
+
+        let tab_count = self.tabs.len();
+        let active_index = self.active_tab_idx.saturating_sub(1);
+
+        // Estimate footer rows to compute available_for_tabs
+        let footer_rows = if self.style.format_footer.is_empty() {
+            0
+        } else {
+            self.style.format_footer.lines().count()
+                + usize::from(!self.style.footer_border.is_empty())
+        };
+        let available_rows = self
+            .last_rows
+            .saturating_sub(header_rows)
+            .saturating_sub(footer_rows);
+
         let (start_index, end_index, tabs_above, _tabs_below) =
-            calculate_visible_range(tab_count, self.last_rows, active_index);
+            calculate_visible_range(tab_count, available_rows, active_index);
 
-        let content_start_row = if tabs_above > 0 { 1 } else { 0 };
+        let content_start_row = usize::from(tabs_above > 0);
 
-        if tabs_above > 0 && row == 0 {
+        // Click on "above" overflow indicator -> go to previous tab
+        if tabs_above > 0 && row_in_tabs == 0 {
             let target = start_index.saturating_sub(1);
             return Some(target + 1);
         }
 
-        let row_in_content = row.saturating_sub(content_start_row);
+        let row_in_content = row_in_tabs.saturating_sub(content_start_row);
         let clicked_tab_index = start_index + row_in_content;
 
         if clicked_tab_index < end_index && clicked_tab_index < tab_count {
