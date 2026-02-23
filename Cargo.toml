@@ -5,9 +5,14 @@ edition = "2024"
 description = "A vertical tab bar plugin for zellij"
 license = "MIT"
 
+[profile.release]
+# Match zjstatus's proven working build configuration exactly.
+# panic=abort is critical: WASI does not support stack unwinding, so without
+# this any panic causes undefined WASM behavior instead of a clean abort.
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+
 [dependencies]
-# Using git dependency for zellij-tile to get unbold_all() method
-# which is only available in main branch (not yet released to crates.io)
-# This allows us to render non-bold text for a cleaner tmux-like appearance
 zellij-tile = "0.43.1"
-unicode-width = "0.2"
+unicode-width = "0.1"

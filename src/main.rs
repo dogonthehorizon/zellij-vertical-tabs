@@ -51,17 +51,17 @@ fn parse_color_spec(name: &str) -> ColorSpec {
     let name = name.trim();
 
     // Check for RGB hex: #RGB or #RRGGBB
-    if let Some(hex) = name.strip_prefix('#')
-        && let Some((r, g, b)) = parse_hex_color(hex)
-    {
-        return ColorSpec::Rgb(r, g, b);
+    if let Some(hex) = name.strip_prefix('#') {
+        if let Some((r, g, b)) = parse_hex_color(hex) {
+            return ColorSpec::Rgb(r, g, b);
+        }
     }
 
     // Check for rgb(r,g,b) syntax
-    if let Some(inner) = name.strip_prefix("rgb(").and_then(|s| s.strip_suffix(')'))
-        && let Some((r, g, b)) = parse_rgb_func(inner)
-    {
-        return ColorSpec::Rgb(r, g, b);
+    if let Some(inner) = name.strip_prefix("rgb(").and_then(|s| s.strip_suffix(')')) {
+        if let Some((r, g, b)) = parse_rgb_func(inner) {
+            return ColorSpec::Rgb(r, g, b);
+        }
     }
 
     // Check for numeric 256-color
@@ -374,16 +374,16 @@ fn parse_variable(chars: &mut std::iter::Peekable<std::str::Chars>) -> FormatTok
     }
 
     // Check for width specifier: =12:varname
-    if let Some(rest) = content.strip_prefix('=')
-        && let Some(colon_pos) = rest.find(':')
-    {
-        let width_str = &rest[..colon_pos];
-        let var_name = &rest[colon_pos + 1..];
-        if let Ok(width) = width_str.parse::<usize>() {
-            return FormatToken::Variable {
-                name: var_name.to_string(),
-                width: Some(width),
-            };
+    if let Some(rest) = content.strip_prefix('=') {
+        if let Some(colon_pos) = rest.find(':') {
+            let width_str = &rest[..colon_pos];
+            let var_name = &rest[colon_pos + 1..];
+            if let Ok(width) = width_str.parse::<usize>() {
+                return FormatToken::Variable {
+                    name: var_name.to_string(),
+                    width: Some(width),
+                };
+            }
         }
     }
 
@@ -600,13 +600,14 @@ struct State {
     style: StyleConfig,
     last_rows: usize,
     permissions_granted: bool,
-    is_selectable: bool,
     pending_events: Vec<Event>,
 
     // Command execution system
     commands: BTreeMap<String, CommandDef>,
     command_outputs: BTreeMap<String, String>,
     timer_ticking: bool,
+    // Note: set_selectable(false) crashes Zellij 0.43.1 when called from a layout plugin pane.
+    // The sidebar is intentionally left selectable until this is fixed upstream.
 }
 
 register_plugin!(State);
@@ -635,25 +636,25 @@ impl ZellijPlugin for State {
         if let Some(v) = configuration.get("indicator_sync") {
             self.style.indicator_sync = v.clone();
         }
-        if let Some(v) = configuration.get("max_name_length")
-            && let Ok(n) = v.parse::<usize>()
-        {
-            self.style.max_name_length = n;
+        if let Some(v) = configuration.get("max_name_length") {
+            if let Ok(n) = v.parse::<usize>() {
+                self.style.max_name_length = n;
+            }
         }
-        if let Some(v) = configuration.get("padding_top")
-            && let Ok(n) = v.parse::<usize>()
-        {
-            self.style.padding_top = n;
+        if let Some(v) = configuration.get("padding_top") {
+            if let Ok(n) = v.parse::<usize>() {
+                self.style.padding_top = n;
+            }
         }
         if let Some(v) = configuration.get("border") {
             self.style.border = v.clone();
         } else if let Some(v) = configuration.get("border_char") {
             self.style.border = v.clone();
         }
-        if let Some(v) = configuration.get("start_index")
-            && let Ok(n) = v.parse::<usize>()
-        {
-            self.style.start_index = n;
+        if let Some(v) = configuration.get("start_index") {
+            if let Ok(n) = v.parse::<usize>() {
+                self.style.start_index = n;
+            }
         }
 
         // ---- Header ----
@@ -734,15 +735,15 @@ impl ZellijPlugin for State {
         }
 
         // ---- Adaptive thresholds ----
-        if let Some(v) = configuration.get("compact_threshold")
-            && let Ok(n) = v.parse::<usize>()
-        {
-            self.style.compact_threshold = n;
+        if let Some(v) = configuration.get("compact_threshold") {
+            if let Ok(n) = v.parse::<usize>() {
+                self.style.compact_threshold = n;
+            }
         }
-        if let Some(v) = configuration.get("minimal_threshold")
-            && let Ok(n) = v.parse::<usize>()
-        {
-            self.style.minimal_threshold = n;
+        if let Some(v) = configuration.get("minimal_threshold") {
+            if let Ok(n) = v.parse::<usize>() {
+                self.style.minimal_threshold = n;
+            }
         }
 
         // ---- Commands ----
@@ -750,10 +751,10 @@ impl ZellijPlugin for State {
         let mut command_names: std::collections::BTreeSet<String> =
             std::collections::BTreeSet::new();
         for key in configuration.keys() {
-            if let Some(rest) = key.strip_prefix("command_")
-                && let Some(name) = rest.strip_suffix("_command")
-            {
-                command_names.insert(name.to_string());
+            if let Some(rest) = key.strip_prefix("command_") {
+                if let Some(name) = rest.strip_suffix("_command") {
+                    command_names.insert(name.to_string());
+                }
             }
         }
 
@@ -781,7 +782,6 @@ impl ZellijPlugin for State {
 
         request_permission(&[
             PermissionType::ReadApplicationState,
-            PermissionType::ChangeApplicationState,
             PermissionType::RunCommands,
         ]);
 
@@ -802,8 +802,6 @@ impl ZellijPlugin for State {
         if let Event::PermissionRequestResult(status) = event {
             if status == PermissionStatus::Granted {
                 self.permissions_granted = true;
-                self.is_selectable = false;
-                set_selectable(false);
 
                 // Start the timer loop if commands are configured
                 if !self.commands.is_empty() && !self.timer_ticking {
@@ -908,29 +906,8 @@ impl ZellijPlugin for State {
         should_render
     }
 
-    fn pipe(&mut self, pipe_message: PipeMessage) -> bool {
-        match pipe_message.name.as_str() {
-            "set_selectable" => {
-                match pipe_message.payload.as_deref() {
-                    Some("true") => {
-                        self.is_selectable = true;
-                        set_selectable(true);
-                    }
-                    Some("false") => {
-                        self.is_selectable = false;
-                        set_selectable(false);
-                    }
-                    _ => {}
-                }
-                false
-            }
-            "toggle_selectable" => {
-                self.is_selectable = !self.is_selectable;
-                set_selectable(self.is_selectable);
-                false
-            }
-            _ => false,
-        }
+    fn pipe(&mut self, _pipe_message: PipeMessage) -> bool {
+        false
     }
 
     fn render(&mut self, rows: usize, cols: usize) {
